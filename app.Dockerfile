@@ -10,10 +10,10 @@ RUN rm -rf /var/lib/apt/lists/
 
 COPY src/ /app/src
 COPY models/ /app/models
-COPY requirements.txt /app
+COPY requirements/base.txt /app
 
 RUN pip install --upgrade pip && \
-    pip install -r requirements.txt
+    pip install -r base.txt
 
 RUN mkdir -p /app/output
 

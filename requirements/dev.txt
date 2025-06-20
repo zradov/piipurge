@@ -1,0 +1,4 @@
+-r base.txt
+
+mypy==1.16.1
+ruff==0.4.10
