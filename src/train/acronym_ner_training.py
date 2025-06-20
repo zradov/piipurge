@@ -1,17 +1,11 @@
 import spacy
-import consts
+from ..piipurge import consts
 from datasets import load_dataset
 from spacy.tokens import Doc, DocBin
 
 
-#["B-long", "B-short", "I-long", "I-short", "O"]
-LABELS = {
-    0: "B-long",
-    1: "B-short",
-    2: "I-long",
-    3: "I-short",
-    4: "O"
-}
+# ["B-long", "B-short", "I-long", "I-short", "O"]
+LABELS = {0: "B-long", 1: "B-short", 2: "I-long", 3: "I-short", 4: "O"}
 
 
 def get_token_bounds_search_func(doc):
@@ -34,8 +28,10 @@ def get_annots(nlp, data):
         doc = Doc(nlp.vocab, words=row["tokens"])
         get_token_bounds = get_token_bounds_search_func(doc)
         ents = [(i, i + 1, LABELS[l]) for i, l in enumerate(row["labels"]) if l != 4]
-        spans = [doc.char_span(*get_token_bounds(row["tokens"][start]), label) 
-                 for start, _, label in ents]
+        spans = [
+            doc.char_span(*get_token_bounds(row["tokens"][start]), label)
+            for start, _, label in ents
+        ]
         spans = [s for s in spans if s is not None]
         doc.set_ents(spans)
         doc_bin.add(doc)
@@ -50,7 +46,7 @@ def main():
     train_annots = get_annots(nlp, ds["train"])
     val_annots = get_annots(nlp, ds["validation"])
     test_annots = get_annots(nlp, ds["test"])
-    
+
     train_annots.to_disk(consts.ACRONYMS_TRAINING_FOLDER / "train.spacy")
     val_annots.to_disk(consts.ACRONYMS_TRAINING_FOLDER / "dev.spacy")
     test_annots.to_disk(consts.ACRONYMS_TRAINING_FOLDER / "test.spacy")
