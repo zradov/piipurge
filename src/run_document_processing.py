@@ -13,22 +13,3 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     process_document(args.input_file, args.output_dir, args.reconstruct)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

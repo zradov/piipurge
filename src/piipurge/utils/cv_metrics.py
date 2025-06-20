@@ -1,4 +1,3 @@
-
 def get_intersection_area(bbox1, bbox2):
     x0, y0, x1, y1 = bbox1
     xx0, yy0, xx1, yy1 = bbox2
@@ -17,8 +16,8 @@ def get_iou(bbox1, bbox2):
     xx0, yy0, xx1, yy1 = bbox2
     intersection_area = get_intersection_area(bbox1, bbox2)
     union_area = (x1 - x0) * (y1 - y0) + (xx1 - xx0) * (yy1 - yy0) - intersection_area
-    
+
     if union_area == 0:
         return 0.0
-    
+
     return intersection_area / union_area

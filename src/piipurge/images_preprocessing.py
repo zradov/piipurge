@@ -16,14 +16,14 @@ def get_files(dir_path, ext=".png"):
                 files.append(file_path)
 
     return files
-        
+
 
 def repair_lines(img):
     gauss_win_size = 1
     gauss_sigma = 3
 
-    img_blur = cv2.GaussianBlur(img, (gauss_win_size,gauss_win_size),gauss_sigma)
-    
+    img_blur = cv2.GaussianBlur(img, (gauss_win_size, gauss_win_size), gauss_sigma)
+
     return img_blur
 
 

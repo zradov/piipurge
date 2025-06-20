@@ -15,26 +15,31 @@ logging.basicConfig(format=consts.LOG_FORMAT, level=logging.INFO)
 
 
 def get_text(file_path):
-  with open(file_path, encoding="utf8") as fh:
-    txt = fh.read()
-    return txt
+    with open(file_path, encoding="utf8") as fh:
+        txt = fh.read()
+        return txt
 
 
 def get_spans(annotations):
-    spans = [(i["begin"], i["end"], i["value"]) 
-             for i in annotations["%FEATURE_STRUCTURES"] 
-             if i["%TYPE"] == "de.tudarmstadt.ukp.dkpro.core.api.ner.type.NamedEntity" and 
-                i.get("value", None) in ["ORG", "POST_CODE", "ADDR", "LOC", "DATE", "PERSON"]]
-                #i.get("value", None) in ["ORG"]]
+    spans = [
+        (i["begin"], i["end"], i["value"])
+        for i in annotations["%FEATURE_STRUCTURES"]
+        if i["%TYPE"] == "de.tudarmstadt.ukp.dkpro.core.api.ner.type.NamedEntity"
+        and i.get("value", None)
+        in ["ORG", "POST_CODE", "ADDR", "LOC", "DATE", "PERSON"]
+    ]
+    # i.get("value", None) in ["ORG"]]
     spans = sorted(spans, key=lambda i: i[0])
 
     return spans
 
 
 def _get_sentences_boundaries(annotations):
-    sentences = [(i["begin"], i["end"]) 
-        for i in annotations["%FEATURE_STRUCTURES"] 
-        if i["%TYPE"] == "de.tudarmstadt.ukp.dkpro.core.api.segmentation.type.Sentence"]
+    sentences = [
+        (i["begin"], i["end"])
+        for i in annotations["%FEATURE_STRUCTURES"]
+        if i["%TYPE"] == "de.tudarmstadt.ukp.dkpro.core.api.segmentation.type.Sentence"
+    ]
     sentences = sorted(sentences, key=lambda i: i[0])
 
     return sentences
@@ -51,7 +56,7 @@ def _get_sent_annots(source_txt, spans, sent_bounds):
 
     while span_index < spans_len:
         span = spans[span_index]
-        # If the current custom span begin index is greater then 
+        # If the current custom span begin index is greater then
         # the current sentence end index move to the next sentence.
         if span[0] > curr_sent_end:
             while curr_sent_end <= span[0]:
@@ -60,13 +65,15 @@ def _get_sent_annots(source_txt, spans, sent_bounds):
                 sent_index += 1
                 curr_sent_start, curr_sent_end = sent_bounds[sent_index]
                 curr_sent = source_txt[curr_sent_start:curr_sent_end]
-        # if the current span boundaries extend over multiple sentences, change 
+        # if the current span boundaries extend over multiple sentences, change
         # the current sentence boundaries so that all the sentences are included.
         while (span[0] >= curr_sent_start) and (span[1] > curr_sent_end):
             sent_index += 1
             curr_sent_end = sent_bounds[sent_index][1]
             curr_sent = source_txt[curr_sent_start:curr_sent_end]
-        doc_spans.append((span[0]-curr_sent_start, span[1]-curr_sent_start, span[2]))
+        doc_spans.append(
+            (span[0] - curr_sent_start, span[1] - curr_sent_start, span[2])
+        )
         span_index += 1
 
     # Add the last doc's spans.
@@ -96,16 +103,21 @@ def create_spacy_doc(doc_annots: Tuple[str, List], language_model="en_core_web_t
             # because of the "expand" value for the alignment_mode, in some cases, a text, that isn't related to
             # the entity type, will be included in the Span object e.g. for token www.iescrow.com/2TheMart
             # if just the "2TheMart" is labeled as a separate entity, the entire URL string will be included.
-            # This can be resolved by using a custom tokenizer rule, modifing the input text so that 
+            # This can be resolved by using a custom tokenizer rule, modifing the input text so that
             # the "2TheMart" is its own token or simply ignoring "2TheMart" string if it occurs inside an URL
-            # and 
-            spans = [doc.char_span(s[0], s[1], label=s[2], alignment_mode="expand") for s in annots]
+            # and
+            spans = [
+                doc.char_span(s[0], s[1], label=s[2], alignment_mode="expand")
+                for s in annots
+            ]
             valid_spans = [s for s in spans if s is not None]
             if len(valid_spans) != len(annots):
-                logging.info(f"The count of valid spans and the count of annotations mismatch: {len(valid_spans)} != {len(annots)}.")
+                logging.info(
+                    f"The count of valid spans and the count of annotations mismatch: {len(valid_spans)} != {len(annots)}."
+                )
                 logging.info(f"Document text: {doc.text}")
             doc.spans["sc"] = valid_spans
-            # because of the "expand" alignment mode, which expands the span to include all tokens that partially 
+            # because of the "expand" alignment mode, which expands the span to include all tokens that partially
             # overlap with the provided character offsets, the starting and the ending position of characters in a span
             # can be changed compared to the original annotations, after calling the char_span method.
             aligned_annots = [(s.start_char, s.end_char, s.label_) for s in valid_spans]
@@ -113,25 +125,33 @@ def create_spacy_doc(doc_annots: Tuple[str, List], language_model="en_core_web_t
             doc_bin.add(example.reference)
 
         return doc_bin
-    
+
     return None
 
 
 def are_group_args_provided(args_group, args):
     for group_action in args_group._group_actions:
-        long_option = group_action.option_strings[-1].replace("--", "").replace("-", "_")
+        long_option = (
+            group_action.option_strings[-1].replace("--", "").replace("-", "_")
+        )
         if getattr(args, long_option) is not None:
             return True
-    
+
     return False
 
 
 def add_single_file_arg_group(parser, group_name="Single file"):
     group = parser.add_argument_group(group_name)
-    
-    group.add_argument("-a", "--annots-file", help="The path to the .json file with annotations.")
+
+    group.add_argument(
+        "-a", "--annots-file", help="The path to the .json file with annotations."
+    )
     group.add_argument("-s", "--txt-file", help="The path to the original .txt file.")
-    group.add_argument("-o", "--out-dir", help="The path to a folder in which the .spacy file will be created.")
+    group.add_argument(
+        "-o",
+        "--out-dir",
+        help="The path to a folder in which the .spacy file will be created.",
+    )
 
     return group
 
@@ -139,9 +159,21 @@ def add_single_file_arg_group(parser, group_name="Single file"):
 def add_multiple_files_arg_group(parser, group_name="Multiple files"):
     group = parser.add_argument_group(group_name)
 
-    group.add_argument("-l", "--annots-dir", help="The path to a folder containing .json files with annotations.")
-    group.add_argument("-t", "--txt-dir", help="The path to a folder containing the original .txt files.")
-    group.add_argument("-d", "--dest-dir", help="The path to a folder in which the .spacy files will be created.")
+    group.add_argument(
+        "-l",
+        "--annots-dir",
+        help="The path to a folder containing .json files with annotations.",
+    )
+    group.add_argument(
+        "-t",
+        "--txt-dir",
+        help="The path to a folder containing the original .txt files.",
+    )
+    group.add_argument(
+        "-d",
+        "--dest-dir",
+        help="The path to a folder in which the .spacy files will be created.",
+    )
 
     return group
 
@@ -151,7 +183,12 @@ def process_program_args():
 
     single_file_arg_group = add_single_file_arg_group(parser)
     multiple_files_arg_group = add_multiple_files_arg_group(parser)
-    parser.add_argument("-g", "--synth-gen", action=argparse.BooleanOptionalAction, help="Whether or not to add synthetically generated data to the original dataset.")
+    parser.add_argument(
+        "-g",
+        "--synth-gen",
+        action=argparse.BooleanOptionalAction,
+        help="Whether or not to add synthetically generated data to the original dataset.",
+    )
 
     args = parser.parse_args()
 
@@ -159,8 +196,10 @@ def process_program_args():
     multiple_file_group_used = are_group_args_provided(multiple_files_arg_group, args)
 
     if single_file_group_used and multiple_file_group_used:
-        print(f"\nERROR: Arguments from '{single_file_arg_group.title}' and '{multiple_files_arg_group.title}'", 
-              "parameters group, are mutually exclusive.\n")
+        print(
+            f"\nERROR: Arguments from '{single_file_arg_group.title}' and '{multiple_files_arg_group.title}'",
+            "parameters group, are mutually exclusive.\n",
+        )
         parser.print_help()
         sys.exit(2)
 
@@ -174,7 +213,7 @@ def _process_annotations(annots_file, txt_file):
     spans = get_spans(annotations)
     sentences_boundaries = _get_sentences_boundaries(annotations)
     sent_annots = _get_sent_annots(source_txt, spans, sentences_boundaries)
-    
+
     return sent_annots
 
 
@@ -192,7 +231,9 @@ def _get_unique_annots(doc_annots: List[Tuple[str, List]]) -> List[Tuple[str, Li
     return unique_annots
 
 
-def _augment_annots(docs_annots: List[Tuple[str, List]], max_augmented_examples=5) -> List[Tuple[str, List]]:
+def _augment_annots(
+    docs_annots: List[Tuple[str, List]], max_augmented_examples=5
+) -> List[Tuple[str, List]]:
     augmented_docs_annots = []
 
     for annots in docs_annots:
@@ -200,9 +241,11 @@ def _augment_annots(docs_annots: List[Tuple[str, List]], max_augmented_examples=
         augmented_docs_annots.extend(augmented_examples)
 
     return augmented_docs_annots
-    
 
-def _process_single_file(annots_file_path: str, txt_file_path: str, out_dir: str, synth_gen: bool) -> None:
+
+def _process_single_file(
+    annots_file_path: str, txt_file_path: str, out_dir: str, synth_gen: bool
+) -> None:
     """
     Processes a single file containing annotations.
 
@@ -224,7 +267,9 @@ def _process_single_file(annots_file_path: str, txt_file_path: str, out_dir: str
         unique_annots += augmented_annots
     """
     unique_annots = balance_examples(unique_annots)
-    logging.info(f"Annotations count: {len(doc_annots)}, unique annotations count: {len(unique_annots)}")
+    logging.info(
+        f"Annotations count: {len(doc_annots)}, unique annotations count: {len(unique_annots)}"
+    )
     doc_bin = create_spacy_doc(unique_annots)
     out_file = os.path.splitext(annots_file_path.split(os.path.sep)[-1])[0] + ".spacy"
     doc_bin.to_disk(os.path.join(out_dir, out_file))
@@ -243,8 +288,12 @@ def _process_multiple_files(annots_dir, txt_dir, out_dir, synth_gen):
 
 def main():
     args = process_program_args()
-    
+
     if getattr(args, "annots_file", None):
-        _process_single_file(args.annots_file, args.txt_file, args.out_dir, args.synth_gen)
+        _process_single_file(
+            args.annots_file, args.txt_file, args.out_dir, args.synth_gen
+        )
     else:
-        _process_multiple_files(args.annots_dir, args.txt_dir, args.dest_dir, args.synth_gen)
+        _process_multiple_files(
+            args.annots_dir, args.txt_dir, args.dest_dir, args.synth_gen
+        )

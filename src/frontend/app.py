@@ -21,13 +21,13 @@ args = parser.parse_args()
 
 # File upload widget
 uploaded_file = st.file_uploader(
-    "Upload PDF documents", 
-    type=["pdf"],
-    accept_multiple_files=False
+    "Upload PDF documents", type=["pdf"], accept_multiple_files=False
 )
 
-reconstruct_text = st.checkbox(label="Reconstruct", 
-                               help="Whether or not to reconstruct the missing text after processing PDF document.")
+reconstruct_text = st.checkbox(
+    label="Reconstruct",
+    help="Whether or not to reconstruct the missing text after processing PDF document.",
+)
 
 if uploaded_file:
     if st.button("Process Document"):
@@ -39,23 +39,31 @@ if uploaded_file:
         with st.spinner("Processing..."):
             # Get file bytes from uploaded files
             file_bytes = uploaded_file.getvalue()
-            
-            with tempfile.NamedTemporaryFile(mode="wb+", suffix=".pdf", delete=False) as temp_file:
+
+            with tempfile.NamedTemporaryFile(
+                mode="wb+", suffix=".pdf", delete=False
+            ) as temp_file:
                 temp_file.write(file_bytes)
                 temp_file.flush()
                 os.fsync(temp_file.fileno())
 
                 try:
                     # Call your package's functionality
-                    process_document(temp_file.name, args.output_dir, reconstruct=reconstruct_text)   
-                    print("Processing complete!")     
+                    process_document(
+                        temp_file.name, args.output_dir, reconstruct=reconstruct_text
+                    )
+                    print("Processing complete!")
                     st.success("Successfully processed the uploaded file.")
-                    output_file_path = os.path.join(args.output_dir, os.path.basename(temp_file.name))
+                    output_file_path = os.path.join(
+                        args.output_dir, os.path.basename(temp_file.name)
+                    )
                     with open(output_file_path, "rb") as fh:
                         processed_data = fh.read()
-                    results_placeholder.download_button("Download processed filed",
-                                                        data=processed_data,
-                                                        file_name=os.path.basename(temp_file.name), 
-                                                        mime="application/pdf")
+                    results_placeholder.download_button(
+                        "Download processed filed",
+                        data=processed_data,
+                        file_name=os.path.basename(temp_file.name),
+                        mime="application/pdf",
+                    )
                 except Exception as ex:
                     st.error(f"Failed to process the uploaded file<br/>{ex}.")
