@@ -38,19 +38,18 @@ and redact PII information in PDF documents.
       * [paraphraser.py](./src/piipurge/utils/paraphraser.py) - used for rephrasing sentences
       * [synth_text_generator.py](./src/piipurge/utils/synth_text_generator.py) - synthetic text generator
       * [uima_cas_to_spacy.py](./src/piipurge/utils/uima_cas_to_spacy.py) - converts UIMA CAS, JSON-based serialization format, annotations, exported using INCEpTION semantic annotation platform, into a binary .spacy format.
-    * [acronym_ner_training.py](./src/piipurge/acronym_ner_training.py) - converts acronym identification dataset "amirveyseh/acronym_identification" into serialized collection of Doc objects and splits it into train, validation and the test subsets.
-    * [acronym_spancat_training.py](./src/piipurge/acronym_spancat_training.py) - NOT USED
     * [analyze_images.py](./src/piipurge/analyze_images.py) - scans images for handwritten and printed signatures and analyzes them using 
   the TrOCR CV model and the Tesseract OCR engine.
     * [consts.py](./src/piipurge/consts.py) - shared constant values used by various scripts
-    * [create_spacy_spancat_dataset.py](./src/piipurge/create_spacy_spancat_dataset.py) - 
-    * [custom_pipelines_old.py](./src/piipurge/custom_pipelines_old.py) - NOT USED
-    * [custom_pipelines_old2.py](./src/piipurge/custom_pipelines_old2.py) - NOT USED
     * [document_processor](./src/piipurge/document_processor.py) - utility functions for images preprocessing before signature recognition analysis.
     * [schemas.py](./src/piipurge/schemas.py) - contains custom data structures definitions.
+  * [train](./src/train) - folder containing NLP and other ML models training scripts
+    * [acronym_ner_training.py](./src/train/acronym_ner_training.py) - converts acronym identification dataset "amirveyseh/acronym_identification" into serialized collection of Doc objects and splits it into train, validation and the test subsets.
+    * [create_spacy_spancat_dataset.py](./src/piipurge/create_spacy_spancat_dataset.py) - splits a .spacy binary file into a train, validation and a test subsets and stores them as separate files.
     * [train_spancat](./src/piipurge/train_spancat.py) - a custom script for training a span categorizer model.
   * [run_document_processing.py](./src/run_document_processing.py) - main script used for running the document processing.
 * [tests](./src/tests) - unit tests
+* [app.Dockerfile](./app.Dockerfile) - instructions file for building a Docker image for a Streamlit app.
 
 ## 3. Architecture
 
