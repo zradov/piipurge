@@ -1,15 +1,16 @@
 import torch
 import joblib
-import torchvision
 import pytesseract
 from . import consts
 from PIL import Image
+from torch.nn import Linear
 from typing import List, Dict, Tuple
 from torchvision.transforms import v2
-from torch.nn import Sequential, Linear
 from .utils.nlp_metrics import get_text_similarity
 from .schemas import ImageTextInfo, SavedImageInfo
 from .images_preprocessing import clear_background
+from torchvision.models import vgg16, VGG16_Weights
+from transformers.modeling_utils import PreTrainedModel
 from transformers import TrOCRProcessor, VisionEncoderDecoderModel
 
 
@@ -76,24 +77,47 @@ def analyze_handwriting(img_paths: List[str]) -> List[Tuple[str, bool]]:
     return results
 
 
-def _extract_features(img):
-    vgg16 = torchvision.models.vgg16()
-    feature_extractor = Sequential(*list(vgg16.children())[:-1])
-    projection_layer = Linear(512 * 7 * 7, 512)
+def _extract_features(images: torch.Tensor, 
+                      weights: object=VGG16_Weights.IMAGENET1K_FEATURES) -> torch.Tensor:
+    """
+    Extracts the image features using the pretrained VGG16 model.
+
+    Args:
+        images: a batch of image data.
+        weights: a set weights related to a pretrained CV model.
+
+    Returns:
+        a Tensor object representing features vector
+    """
+    
+    vgg16_model = vgg16(weights=weights)
+    
+    vgg16_model.eval()
 
     with torch.no_grad():
-        features = feature_extractor(img)
+        features = vgg16_model.features(images)
+        features = vgg16_model.avgpool(features)
         features = torch.flatten(features, start_dim=1)
+        projection_layer = Linear(features.shape[1], 512)
         features = projection_layer(features)
 
-        return features
+        
+    return features
 
 
-def _get_image_transformations(mean, std):
+def _get_image_transformations(mean: torch.Tensor, std: torch.Tensor) -> v2.Compose:
     """
     Returns the transformation pipeline used for transforming images prior to
     running a prediction using a handwriting recognition model.
+
+    Args:
+        mean: the mean values used for image normalization.
+        std: the standard deviation value used for image normalization.
+
+    Returns:
+        a v2.Compose object representing image transformation pipeline.
     """
+
     transform = v2.Compose(
         [
             v2.ToImage(),
@@ -121,7 +145,7 @@ def _get_print_processor(model_name: str) -> object:
     return processor
 
 
-def _get_vision_model(model_name: str, processor, num_return_sequences: int = 3):
+def _get_vision_model(model_name: str, processor, num_return_sequences: int = 3) -> PreTrainedModel:
     """
     Loads and returns an instance of the pretrained TrOCR decoder model.
 
@@ -153,15 +177,28 @@ def _get_vision_model(model_name: str, processor, num_return_sequences: int = 3)
     return model
 
 
-def _analyze_print_from_image(image, model, processor):
-    # input = image_processor(image, input_data_format="channels_last")
+def _analyze_print_from_image(image: Image.Image, 
+                              model: PreTrainedModel, 
+                              processor: object) -> Tuple[List[str], List[torch.Tensor]]:
+    """
+    Runs printed characters identification using a specialized pretrained CV model
+    and returns predictions along with their confidence score.
+    
+    Args:
+        vision_model: a pretrained CV model instance specialized for printed characters identification.
+        image_processor: image pre-processing tool used for transforming the image data into a format 
+                         expected by the pretrained model.
+
+    Returns:
+        a tuple containing a list of predictions and a list of confidence scores related to the predictions.
+    """
+
     pixel_values = processor(
         image, return_tensors="pt", input_data_format="channels_last"
     ).pixel_values
     generate_result = model.generate(
         pixel_values,
         output_scores=True,
-        # num_return_sequences=num_return_sequences,
         return_dict_in_generate=True,
     )
     ids, scores = generate_result["sequences"], generate_result["sequences_scores"]
@@ -191,7 +228,19 @@ def _are_textboxes_adjacent(text_box: List[int], text_boxes: List[List[int]]) ->
     return False
 
 
-def _run_ocr(img_path):
+def _run_ocr(img_path: str) -> Tuple[Image.Image, Dict]:
+    """
+    Runs Tesseract OCR analysis on the image and returns image data along with text 
+    boxes boundaries, confidence scores and other information.
+    
+    Args:
+        img_path: a path to the image that need to be analyzed.
+
+    Returns:
+        a tuple containing a PIL Image object and a dictionary with information about
+        text boxes, confidence scores, line and page numbers.
+    """
+
     image = Image.open(img_path).convert("RGB")
     ocr_data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
 
@@ -199,14 +248,37 @@ def _run_ocr(img_path):
 
 
 def _get_text_bboxes(
-    image,
-    ocr_data,
-    vision_model,
-    image_processor,
+    image: Image.Image,
+    ocr_data: Dict,
+    vision_model: PreTrainedModel,
+    image_processor: object,
     include_empty_text=True,
     score_threshold=-0.05,
     text_similarity_threshold=0.95,
 ):
+    """
+    Runs pretrained vision model for printed characters identification on cropped image 
+    containing text and returns identified text and its boundaries.
+
+    Args:
+        image: PIL Image object.
+        ocr_data: a dictionary containing information about the text and its boundaries that's 
+                  retrieved after running Tesseract OCR on the image.
+        vision_model: a pretrained CV model instance specialized for printed characters identification.
+        image_processor: image pre-processing tool used for transforming the image data into a format 
+                         expected by the pretrained model.
+        include_empty_text: whether or not to include text boxes containing no text when running printed
+                            characters identification.
+        score_threshold: a lowest acceptable confidence score for identified printed characters, any 
+                         identified characters with the confidence score below that value will be ignored.
+        text_similarity_threshold: a lowest acceptable text similarity score for texts identified by the 
+                                   two text identification models, similarity score below the threshold will
+                                   cause the text to be ignored.
+
+    Returns:
+        a list of dictionaries containing identified text and its boundaries.
+    """
+
     text_bboxes = []
 
     for idx, ocr_text in enumerate(ocr_data["text"]):
