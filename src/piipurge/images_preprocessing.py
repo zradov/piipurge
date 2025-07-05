@@ -64,11 +64,9 @@ def clear_background(img_path: str, threshold_color: int=200) -> None:
     """
 
     img = cv2.imread(img_path)
-
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     black_mask = gray < threshold_color
     output = np.ones_like(img) * 255
     output[black_mask] = [0, 0, 0]
     img = repair_lines(output)
-
     cv2.imwrite(img_path, img)
