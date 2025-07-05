@@ -133,7 +133,7 @@ class SavedImageInfo(NamedTuple):
     # An absolute path to an image on a local file system.
     img_path: str
     # An unique cross-reference number of object in a PDF document.
-    xref: Tuple[float, float, float, float]
+    xref: str
     # An index of the page, containing the drawing, in the PDF document.
     page_number: int
 
