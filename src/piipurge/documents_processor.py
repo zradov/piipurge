@@ -1,25 +1,26 @@
 import os
-import io
 import re
 import fitz
-import spacy
-import string
 import logging
 import tempfile
 import datasets
-import unicodedata
 from . import consts
-from torch import Tensor
 from pathlib import Path
-from PIL import Image, ImageDraw
 from spacy.tokens import Doc, Span
-from spacy.util import filter_spans
 from spacy.language import Language
-from spacy.pipeline import Sentencizer
-from .utils.drawing import merge_intersecting_rects
-from sentence_transformers import SentenceTransformer
-from pymupdf import Document, Page, Rect, Pixmap, Point
-from .utils.fonts import get_text_length, get_matching_font
+from .utils.drawing import save_drawings
+from .utils.fonts import get_text_length
+from .utils.pdf import (
+    replace_text, fill_bg, draw_paragraph_annots, substitute_page_entities,
+    apply_redactions, get_image_rects, draw_redact_rects, extract_pdf_images,
+    get_paragraphs, extract_pdf_drawings, save_processed_document
+)
+from .utils.nlp import (
+    load_nlp_model, load_nlp_acronyms_model, load_text_encoder_model,
+    check_common_acronyms, get_most_similar_text, get_ent_replacement, 
+    find_entity_boundaries
+)
+from pymupdf import Document, Page, Rect, Pixmap
 from .analyze_images import analyze_print, analyze_handwriting
 from .schemas import (
     LinePos,
@@ -36,285 +37,25 @@ from .schemas import (
     ImageTextInfo,
 )
 from typing import (
-    Pattern,
-    Union,
     Set,
     List,
     Tuple,
     Optional,
     Dict,
     Sequence,
-    Generator,
-    Callable,
+    Generator
 )
-from difflib import SequenceMatcher
 
 datasets.disable_progress_bar()
 logging.basicConfig(format=consts.LOG_FORMAT, level=logging.INFO)
-fitz.TOOLS.set_small_glyph_heights(True)
 
-
-def find_matching_entities(doc: Doc, regex: Pattern, label: str) -> Doc:
-    """
-    Finds entities that match the given regex pattern, marks the string
-    matches with the Spacy's NER label and assigns named entities to the Doc
-    object.
-
-    Args:
-        doc: Spacy Doc object
-        regex: compiled regex pattern
-        label: Spacy's NER label
-
-    Returns:
-        The loaded nlp object.
-    """
-
-    matches = regex.finditer(doc.text)
-    spans = [
-        doc.char_span(match.start(), match.end(), label=label) for match in matches
-    ]
-    spans = [s for s in spans if s is not None]
-    spans = filter_spans(list(doc.ents) + spans)
-    doc.ents = spans
-    return doc
-
-
-@Language.component("ipv4")
-def ipv4_component(doc: Doc):
-    doc = find_matching_entities(doc, consts.PATTERNS["ipv4"], "IPv4")
-    return doc
-
-
-@Language.component("ipv6")
-def ipv6_component(doc: Doc):
-    doc = find_matching_entities(doc, consts.PATTERNS["ipv6"], "IPv6")
-    return doc
-
-
-@Language.component("phone")
-def phone_component(doc: Doc):
-    doc = find_matching_entities(doc, consts.PATTERNS["phone"], "PHONE")
-    return doc
-
-
-@Language.component("email")
-def email_component(doc: Doc):
-    doc = find_matching_entities(doc, consts.PATTERNS["email"], "EMAIL")
-    return doc
-
-
-@Language.component("ssn")
-def ssn_component(doc: Doc):
-    doc = find_matching_entities(doc, consts.PATTERNS["ssn"], "SSN")
-    return doc
-
-
-@Language.component("medicare")
-def medicare_component(doc: Doc):
-    doc = find_matching_entities(doc, consts.PATTERNS["medicare"], "MEDICARE")
-    return doc
-
-
-@Language.component("vin")
-def vin_component(doc: Doc):
-    doc = find_matching_entities(doc, consts.PATTERNS["vin"], "VIN")
-    return doc
-
-
-@Language.component("url")
-def url_component(doc: Doc):
-    doc = find_matching_entities(doc, consts.PATTERNS["url"], "URL")
-    return doc
-
-
-@Language.component("custom_sentencizer")
-def get_sentencizer(doc: Doc):
-    sentencizer = Sentencizer(punct_chars=[r"\n"])
-    return sentencizer(doc)
-
-
-def _normalize_utf8_text(text):
-    """ """
-    # Unicode NFC normalization
-    text = unicodedata.normalize("NFC", text)
-
-    # Replace no-break space with regular space
-    text = text.replace("\u00a0", " ")
-
-    # Translate some special punctuation characters
-    translation_table = {
-        ord("\u2018"): "'",
-        ord("\u2019"): "'",
-        ord("\u201c"): '"',
-        ord("\u201d"): '"',
-        ord("\u2013"): "-",
-        ord("\u2014"): "-",
-        ord("\u2026"): "...",
-        ord("\u00b7"): "-",
-    }
-    text = text.translate(translation_table)
-
-    # Remove zero-width spaces and formatting chars
-    text = re.sub(r"[\u200B\u200E\u200F\uFEFF]", "", text)
-
-    # Normalize whitespace
-    text = re.sub(r"\s+", " ", text).strip()
-
-    return text
-
-
-def is_link(text: str) -> bool:
-    """
-    Check whether a string refers to an URL or an e-mail address.
-
-    Args:
-        text: text to check.
-
-    Returns:
-        True if a string represents an URL or e-mail address otherwise False.
-    """
-    return (
-        consts.PATTERNS["url"].match(text) is not None
-        or consts.PATTERNS["email"].match(text) is not None
-    )
-
-
-def get_spans_similarity(
-    span1: str, span2: str, text_encoder: SentenceTransformer
-) -> Tensor:
-    """
-    Measures strings similiarity by computing the cosine similarity.
-
-    Args:
-        span1: the first string value.
-        span2: the second string value.
-        text_encoder: text encoding model.
-
-    Returns:
-        a Tensor object containing strings similiarity score.
-    """
-    span1_embedding = text_encoder.encode(span1, show_progress_bar=False)
-    span2_embedding = text_encoder.encode(span2, show_progress_bar=False)
-    similarity = text_encoder.similarity(span1_embedding, span2_embedding)
-
-    return similarity
-
-
-def check_common_acronyms(
-    span_text: str,
-    common_acronyms: list[str],
-    text_encoder: SentenceTransformer,
-    similarity_score_threshold: float = 0.95,
-) -> str | None:
-    """
-    Checks whether the given span text value refers to a common acronym.
-
-    Args:
-        span_text: the text the need to be verified against common acronyms.
-        common_acronyms: a list of common acronyms strings.
-        text_encoder: an text encoder model used for measuring text similarity.
-        similarity_score_threshold: threshold used when deciding if two strings are equal or not.
-
-
-    Returns:
-        a string value with matching common acronym if such acronyms is found otherwise None.
-    """
-    max_similarity = 0
-    optim_acronym = None
-    for acronym in common_acronyms:
-        span_similarity_score = get_spans_similarity(acronym, span_text, text_encoder)
-        if (span_similarity_score > max_similarity) and (
-            span_similarity_score > similarity_score_threshold
-        ):
-            optim_acronym = acronym
-            max_similarity = span_similarity_score
-
-    return optim_acronym
-
-
-def get_most_similar_text(
-    texts_to_compare: Optional[List[str]],
-    texts: Optional[List[Union[str, Tuple[str, str]]]],
-    text_encoder: SentenceTransformer,
-    similarity_score_threshold: float = 0.95,
-) -> str | None:
-    """
-    Finds the most similar text from a list of candidate texts relative to a reference set,
-    based on a similarity threshold.
-
-    Args:
-        texts_to_compare: list of reference text strings to compare against.
-        texts: list of candidate texts to find the most similar match from.
-               Each element can be a string or a tuple of two strings.
-        text_encoder: a text encoder model used for computing text embeddings and measuring similarity.
-        similarity_score_threshold: minimum similarity score required for a match to be considered.
-
-    Returns:
-        A text value (string or tuple) from the `texts` list that is most similar to any of the `texts_to_compare`
-        and has a similarity score above the threshold. Returns None if no match meets the threshold.
-    """
-
-    most_similar_text = None
-
-    if (texts_to_compare is not None) and (texts is not None):
-        curr_max_similarity = 0
-        for text1 in texts_to_compare:
-            for text2 in texts:
-                if isinstance(text2, tuple):
-                    text_similarity_score = max(
-                        get_spans_similarity(text2[0], text1, text_encoder),
-                        get_spans_similarity(text2[1], text1, text_encoder),
-                    )
-                else:
-                    text_similarity_score = get_spans_similarity(
-                        text2, text1, text_encoder
-                    )
-                if (text_similarity_score > curr_max_similarity) and (
-                    text_similarity_score > similarity_score_threshold
-                ):
-                    most_similar_text = text2
-                    curr_max_similarity = text_similarity_score
-
-    return most_similar_text
-
-
-def get_ent_replacement(
-    ent: Span, suffix_type: str | int, entities_count: int = 0
-) -> str:
-    """
-    For the given Spacy named entity type returns its unique identifier in the document.
-
-    Args:
-        ent: the target Span object
-        suffix_type: a suffix value assigned to the span replacement string,
-                     it can be integer or character and it represents an index
-                     value of the entity object in the document.
-        entities_count: current count of entities with type equal to the the ent.label_ type,
-                        it is used to determine the next index value.
-
-    Returns:
-        a string representing the entity replacement string.
-
-    Raises:
-        Exception: if the suffix_type is of unsupported type.
-    """
-    if suffix_type is str:
-        suffix = (
-            int(round(entities_count / len(string.ascii_uppercase))) * "A"
-            + string.ascii_uppercase[entities_count % len(string.ascii_uppercase)]
-        )
-        return f'"{consts.ENTITY_DESC[ent.label_][0]} {suffix}"'
-    elif suffix_type is int:
-        return f'"{consts.ENTITY_DESC[ent.label_][0]} {entities_count+1}"'
-
-    raise Exception(f"Unsupported suffix type '{suffix_type}")
 
 
 def get_closest_ent_name(
     texts: List[str],
     ent_cat_subs: Set[str],
     relations: List[Tuple[str, str]],
-    text_encoder: SentenceTransformer,
+    text_encoder: object,
 ) -> Optional[str]:
     """
     Finds the closest entity name from a set of candidate entities based on text similarity.
@@ -329,6 +70,7 @@ def get_closest_ent_name(
     Returns:
         The closest matching entity name (str) if found, otherwise None.
     """
+
     relation = get_most_similar_text(texts, relations, text_encoder)
     closest_ent_name = None
 
@@ -338,7 +80,7 @@ def get_closest_ent_name(
             if relation[0] in ent_cat_subs
             else relation[1] if relation[1] in ent_cat_subs else None
         )
-        if not closest_ent_name:
+        if closest_ent_name is not None:
             closest_ent_name = get_most_similar_text(texts, ent_cat_subs, text_encoder)
 
     return closest_ent_name
@@ -349,7 +91,7 @@ def _update_subs(
     ents: List[Span],
     relations: List[Tuple[str, str]],
     common_acronyms: List[str],
-    text_encoder: SentenceTransformer,
+    text_encoder: object,
     paragraph: Paragraph,
 ) -> None:
     """
@@ -363,12 +105,13 @@ def _update_subs(
         ents: recognized named entities in the document.
         relations: a list, where each element represents a combination of an acronym and its longer form.
         common_acronyms: a list of strings representing acronyms.
-        text_encoder: the model for the text encoding.
+        text_encoder: the model used for text encoding.
         paragraph_index: an index of the paragraph to which the named entity object belongs.
 
     Returns:
         None
     """
+
     for ent in ents:
         if not _should_process_entity(ent, common_acronyms, text_encoder):
             continue
@@ -387,7 +130,7 @@ def _update_subs(
 
 
 def _should_process_entity(
-    ent: Span, common_acronyms: List[str], text_encoder: SentenceTransformer
+    ent: Span, common_acronyms: List[str], text_encoder: object
 ):
     """
     Determines whether the text representing a named entity should be further processed.
@@ -395,11 +138,12 @@ def _should_process_entity(
     Args:
         ent: named entity object
         common_acronyms: a list of strings representing acronyms
-        text_encoder: the model for the text encoding
+        text_encoder: the model used for the encoding
 
     Returns:
         True if the entity type is in the supported entity types dictionary otherwise False
     """
+
     if ent.label_ not in consts.ENTITY_DESC:
         return False
     if ent.label_ == "ORG":
@@ -414,7 +158,7 @@ def _process_org_entity(
     ent: Span,
     relations: List[Tuple[str, str]],
     ent_subs: dict[str, List[EntitySubstitute]],
-    text_encoder: SentenceTransformer,
+    text_encoder: object,
     suffix_type: str,
     paragraph: Paragraph,
 ) -> None:
@@ -428,7 +172,7 @@ def _process_org_entity(
                   and their replacement strings where the tuple value is in the following format:
                   (REPLACEMENT_STRING, STARTING_CHAR_IN_DOCUMENT, ENDING_CHAR_IN_DOCUMENT,
                    STARTING_CHAR_IN_SENTENCE, ENDING_CHAR_IN_SENTENCE, PARAGRAPH_INDEX)
-        text_encoder: the model for the text encoding
+        text_encoder: the model used for text encoding
         suffix_type: a suffix value assigned to the span replacement string,
                      it can be integer or character and it represents an index
                      value of the entity object in the document.
@@ -437,6 +181,7 @@ def _process_org_entity(
     Returns:
         None
     """
+
     texts_to_compare = [ent.text]
     relation = get_most_similar_text([ent.text], relations, text_encoder)
     if relation:
@@ -461,62 +206,6 @@ def _process_org_entity(
             ent, get_ent_replacement(ent, suffix_type, len(ent_subs)), paragraph
         )
     )
-
-
-def _find_best_matching_string(
-    source_text: str,
-    target_text: str,
-    start_char: int,
-    end_char: int,
-    best_match_ratio: float,
-    iterate_fn: Callable[[int, int], Tuple[int, int]],
-) -> Tuple[float, int, int]:
-    sm = SequenceMatcher(None, source_text, target_text[start_char:end_char])
-    old_start_char, old_end_char = start_char, end_char
-    while True:
-        if sm.ratio() < best_match_ratio:
-            break
-        best_match_ratio = sm.ratio()
-        old_start_char, old_end_char = start_char, end_char
-        start_char, end_char = iterate_fn(start_char, end_char)
-        sm.set_seq2(target_text[start_char:end_char])
-
-    return best_match_ratio, old_start_char, old_end_char
-
-
-def _find_entity_boundaries(ent: Span, paragraph: Paragraph) -> Tuple[int, int, float]:
-    text_index = paragraph["text"].find(ent.text)
-    if text_index != -1:
-        return text_index, text_index + len(ent.text), 1.0
-    char_start_index = _normalize_utf8_text(paragraph["text"]).index(ent.text)
-    start_char = _normalize_utf8_text(paragraph["text"]).index(ent.text)
-    best_match_ratio, start_char, end_char = _find_best_matching_string(
-        ent.text,
-        paragraph["text"],
-        char_start_index,
-        char_start_index + len(ent.text),
-        0.0,
-        lambda s, e: (s + 1, e + 1),
-    )
-    best_match_ratio, start_char, end_char = _find_best_matching_string(
-        paragraph["text"][start_char:end_char],
-        paragraph["text"],
-        start_char,
-        start_char + len(ent.text),
-        best_match_ratio,
-        lambda s, e: (s, e + 1),
-    )
-    best_match_ratio, start_char, end_char = _find_best_matching_string(
-        paragraph["text"][start_char:end_char],
-        paragraph["text"],
-        start_char,
-        end_char,
-        best_match_ratio,
-        lambda s, e: (s - 1, e),
-    )
-    logging.info(f"(_find_entity_boundaries): best_match_ratio: {best_match_ratio}")
-
-    return start_char, end_char, best_match_ratio
 
 
 def _process_standard_entity(
@@ -570,25 +259,10 @@ def _is_entity_inside_line(ent_start_char: int, ent_end_char) -> bool:
     return fn
 
 
-def _get_paragraph_line_indices(
-    ent: Span, paragraph: Paragraph, min_match_ratio=0.95
-) -> List[int]:
-    ent_start_char, ent_end_char, best_match_ratio = _find_entity_boundaries(
-        ent, paragraph
-    )
-    if best_match_ratio < min_match_ratio:
-        raise f"Text {ent.text} not found in the paragraph {paragraph['text']}"
-    lines_indices = list(
-        filter(_is_entity_inside_line(ent_start_char, ent_end_char), paragraph["lines"])
-    )
-
-    return lines_indices
-
-
 def _create_entity_substitute(
     ent: Span, new_val: str, paragraph: Paragraph, min_match_ratio=0.95
 ) -> Generator[EntitySubstitute, None, None]:
-    ent_start_char, ent_end_char, best_match_ratio = _find_entity_boundaries(
+    ent_start_char, ent_end_char, best_match_ratio = find_entity_boundaries(
         ent, paragraph
     )
     if best_match_ratio < min_match_ratio:
@@ -628,6 +302,7 @@ def is_acronym(short_form: str, long_form_entities: List[str]) -> bool:
         True if the short string form and entities list relate to the same acronym
         otherwise False.
     """
+
     long_acronym = "".join(ent.text[0].upper() for ent in long_form_entities)
     long_acronym = re.sub(r"[^\w]", "", long_acronym)
     return short_form.upper() == long_acronym
@@ -643,6 +318,7 @@ def _find_short_long_relations(acronyms_ents: Sequence[Span]) -> List[Tuple[str,
     Returns:
         a list where each element contains the expanded acronym form and the acronym.
     """
+
     if len(acronyms_ents) == 0:
         return
     long_form = []
@@ -679,6 +355,7 @@ def _is_new_long_form(tag: str, start: int, long_form_range: Tuple[int, int]) ->
         the token's distance between the last recognized IOB token and the current token index is
         greater than 2, otherwise False.
     """
+
     return (
         tag.startswith("B-long") or tag.startswith("I-long")
     ) and start - long_form_range[1] > 2
@@ -700,6 +377,7 @@ def _is_continuation_of_long_form(
         True if a token with the given tag is inside a set of tokens representing an expanded
         acronym otherwise False.
     """
+
     return (tag.startswith("I-long")) or (
         tag.startswith("B-long") and (start - long_form_range[1] <= 2)
     )
@@ -726,6 +404,7 @@ def _is_short_form(
     Returns:
         True if the named entity object represents an acronym otherwise False.
     """
+
     if (
         not tag.startswith("B-short")
         or not long_form
@@ -750,6 +429,7 @@ def get_redacted_text(line_subs: List[LineSubstitute], redact_char="x") -> str:
     Returns:
         text with redacted text being replaced with the replacement character.
     """
+
     redacted_text = line_subs[0].line_info.text
     sorted_line_subs = list(
         sorted(line_subs, key=lambda i: i.ent_start_char, reverse=True)
@@ -762,7 +442,18 @@ def get_redacted_text(line_subs: List[LineSubstitute], redact_char="x") -> str:
 
 
 def redact_text(sub: LineSubstitute, redacted_text: str, redact_char: str) -> str:
-    """ """
+    """ 
+    Performs text redaction by replacing the text with the specified redaction character.
+
+    Args:
+        sub: contains information about the text value that need to be replaced.
+        redacted_text: a line of text that's being redacted.
+        redact_char: a replacement character used to replace each character in the redacted text.
+
+    Returns:
+        a redacted line of text.
+    """
+
     # It's assumed that all spans in a line have the same font name and the font size.
     # For more robust solution each span's font name and font size should be inspected
     # separately.
@@ -775,160 +466,12 @@ def redact_text(sub: LineSubstitute, redacted_text: str, redact_char: str) -> st
     ):
         new_val = new_val[:-1]
     text = (
-        redacted_text[: sub.ent_start_char]
+        redacted_text[:sub.ent_start_char]
         + new_val
-        + redacted_text[sub.ent_end_char :]
+        + redacted_text[sub.ent_end_char:]
     )
 
     return text
-
-
-def get_redact_annots(
-    page: Page,
-    line_subs: LineSubstitute,
-    use_span_bg: bool = False,
-    fill_color: Tuple[float, float, float] = (0, 0, 0),
-) -> List[TextRedactInfo]:
-    """
-    Returns a list of redaction information.
-
-    Args:
-        page: PyMuPDF's page object.
-        line_subs: a list of all text substitutes for a specific line.
-        use_span_bg: whether or not to use span background as the redaction rectangle fill color.
-        fill_color: default fill color for the redaction rectangle.
-    """
-    redactions = []
-
-    if line_subs:
-        for line_sub in line_subs:
-            rects = page.search_for(
-                line_sub.old_val,
-                clip=line_sub.line_info.spans_bbox,
-                quads=False,
-                flags=0,
-            )
-            for r in rects:
-                redact_info = get_text_redact_info(
-                    page.number, r, line_sub, use_span_bg, fill_color
-                )
-                redactions.append(redact_info)
-
-    return redactions
-
-
-def _get_redact_rect(
-    rect: Rect, offset_y: float = 0.01
-) -> Tuple[float, float, float, float]:
-    center_y = rect[1] + (rect[3] - rect[1]) / 2
-    redact_rect = (rect[0], center_y - offset_y, rect[2], center_y + offset_y)
-
-    return redact_rect
-
-
-def get_text_redact_info(
-    page_number: int,
-    rect: Rect,
-    line_sub: LineSubstitute,
-    use_span_bg: bool,
-    default_redact_color: Tuple[float, float, float],
-) -> TextRedactInfo:
-    """
-    Return information about the text redaction area.
-
-    Args:
-        page_number: the page's index in the PDF document.
-        rect: the redaction area.
-        line_sub: information about all text replacements in a specific line.
-        use_span_bg: whether or not to use span background as the redaction rectangle fill color.
-        default_redacted_color: default fill color for the redaction rectangle.
-
-    Returns:
-        a text redaction info.
-    """
-    draw_redact_rect = [
-        rect[0],
-        line_sub.line_info.spans_bbox[1],
-        rect[2],
-        line_sub.line_info.spans_bbox[3],
-    ]
-    # The height of the redaction rectangle will be reduced as much as possible, in order to
-    # avoid the issue with redactions of text in the neighboring lines, as describe in the issue
-    # https://github.com/pymupdf/PyMuPDF/discussions/1810
-    redact_rect = _get_redact_rect(rect)
-    # If span background should be used as the fill color, for the redact annotation rectangle,
-    # choose the fill color of the first span containing text that need to be redacted.
-    redact_color = (
-        line_sub.sub_spans[0]["fill_color"] if use_span_bg else default_redact_color
-    )
-
-    return TextRedactInfo(
-        page_number=page_number,
-        rect=redact_rect,
-        draw_rect=draw_redact_rect,
-        line_sub=line_sub,
-        fill_color=redact_color,
-    )
-
-
-def fill_bg(page: Page, line: LineInfo, margin: int = 0) -> None:
-    """
-    Fills in the background of all spans containing the text that's being redacted.
-
-    Args:
-        page: PyMuPDF's page object.
-        line: a LineInfo object.
-        margin: margin of the redaction bounding box.
-
-    Returns:
-        None
-    """
-
-    for span in line.spans:
-        bbox = span["bbox"]
-        redact_bbox = [
-            bbox[0] - margin,
-            bbox[1] - margin,
-            bbox[2] + margin,
-            bbox[3] + margin,
-        ]
-        page.draw_rect(redact_bbox, color=span["fill_color"], fill=span["fill_color"])
-
-
-def replace_text(page: Page, line: LineInfo, text: str) -> None:
-    """
-    Replaces the text in spans objects containing the text that's being redacted.
-
-    Args:
-        page: a PyMuPDF's Page object.
-        line: a metadata object about the line containing text that's being redacted.
-        text: replacement text
-
-    Returns:
-        None
-    """
-
-    offset = 0
-    for span in line.spans:
-        text_color = (
-            span["color"]
-            if isinstance(span["color"], tuple)
-            else [round(c / 255.0, 2) for c in fitz.sRGB_to_rgb(span["color"])]
-        )
-        kwargs = dict(
-            fontsize=span["size"], color=text_color, fill_opacity=span["alpha"]
-        )
-
-        font_metadata = get_matching_font(span["font"])
-        kwargs["fontfile"] = font_metadata["font_path"]
-        span_text = text[span["text_start"] : span["text_end"]]
-        _ = page.insert_text(
-            (span["origin"][0] + offset, span["origin"][1]), span_text, **kwargs
-        )
-        new_text_length_pts = get_text_length(
-            span_text, font_name=font_metadata["full_name"], font_size=span["size"]
-        )
-        offset += new_text_length_pts - (span["span_bbox"][2] - span["span_bbox"][0])
 
 
 def is_neighboring_line(line: LineInfo, lines: List[int]) -> bool:
@@ -978,38 +521,6 @@ def get_redacted_paragraphs(
         redacted_paragraphs[key] = parag_replacements
 
     return redacted_paragraphs
-
-
-def draw_paragraph_annots(
-    page: Page,
-    line: LineInfo,
-    redacted_lines: List[int],
-    parag_replacements: List[Tuple[Tuple[float, float, float, float], LineSubstitute]],
-    redact_rect_color: Tuple[float, float, float] = (0, 0, 0),
-) -> None:
-    """
-    Draws a separate redaction annotation rectangle over each redacted text area.
-
-    Args:
-        page: PyMuPDF's page object.
-        line: a LineInfo object.
-        redacted_lines: a list of integers representing indices of lines in a paragraph.
-        parag_replacements: a list of tuples consisting of rectangle of redacted area and the LineSubstitute object containing metadata
-                            about the line and the text being redacted.
-        redact_rect_color: a fill in color of the redaction rectangle.
-
-    Returns:
-        None
-    """
-
-    if line["paragraph_line_index"] in redacted_lines:
-        line_subs = [
-            r
-            for r in parag_replacements
-            if r[1]["paragraph_line_index"] == line["paragraph_line_index"]
-        ]
-        for redact_rect, _ in line_subs:
-            page.draw_rect(redact_rect, color=redact_rect_color, fill=redact_rect_color)
 
 
 def _reconstruct_deleted_text(
@@ -1065,127 +576,6 @@ def _reconstruct_deleted_text(
                     )
 
 
-def substitute_page_entities(
-    pdf: Document, lines_subs: Dict[LinePos, List[Dict]], min_distance=3
-) -> List[TextRedactInfo]:
-    """
-    Returns a list of TextRedactInfo objects related to the redaction of textual information.
-
-    Args:
-        pdf: a PDF document object.
-        lines_subs: a dictionary containing pairs of line positions and all text replacements for each line.
-                    For details about the data structure see the documentation for the _map_subs_to_lines function,
-                    specifically description for the return value.
-        min_distance: minimum distance between the location of the ending character, of the previous entity instance,
-                      and the starting character location for the new entity instance. If the value is greater than
-                      the specified the new entity instance will be considered as a separate instance of the particular
-                      entity type, otherwise the location of the ending character, of the previous entity instance, will
-                      be expand to match the ending character of the new instance.
-
-    Returns:
-        a list of redaction annotations for each recognized named entity in the document.
-    """
-
-    redactions = []
-
-    for (page_num, _), occurences in lines_subs.items():
-        replacements = []
-        orgs_to_replace = []
-
-        for line_subs in occurences:
-            if line_subs.entity_substitute.ent_type == "ORG":
-                if orgs_to_replace:
-                    last_org = orgs_to_replace[-1]
-                    if line_subs.old_val == last_org.old_val:
-                        if (
-                            line_subs.ent_start_char - last_org.ent_end_char
-                            <= min_distance
-                        ) and (
-                            last_org.entity_substitute.new_val
-                            == line_subs.entity_substitute.new_val
-                        ):
-                            # The new ORG will not be added, instead the previous ORG's ending character index
-                            # will be expanded so that it includes the new ORG.
-                            new_org_end_char = line_subs.ent_end_char
-                            if (
-                                len(last_org.line_info.text) - 1 < new_org_end_char
-                            ) and (
-                                last_org.line_info.text[new_org_end_char + 1] == ")"
-                            ):
-                                new_org_end_char += 1
-                            last_org = last_org._replace(ent_end_char=new_org_end_char)
-                            orgs_to_replace[-1] = last_org
-                            continue
-                orgs_to_replace.append(line_subs)
-            else:
-                replacements.append(line_subs)
-
-        for org_line_sub in orgs_to_replace:
-            replacements.append(org_line_sub)
-
-        page = pdf[page_num]
-
-        if replacements:
-            annots = get_redact_annots(page, replacements)
-            if annots:
-                redactions.extend(annots)
-
-    return redactions
-
-
-def add_utf8_normalization(nlp: Language):
-    original_make_doc = nlp.make_doc
-
-    def make_doc_with_utf8_normalization(text):
-        normalized_text = _normalize_utf8_text(text)
-        return original_make_doc(normalized_text)
-
-    nlp.make_doc = make_doc_with_utf8_normalization
-
-
-def load_nlp_model(model_name: str = "en_core_web_trf") -> Language:
-    """
-    Loads and returns a NLP model used for PDF text processing.
-
-    Args:
-        model_name: a name of the model
-
-    Returns:
-        a Spacy's text-processing pipeline object.
-    """
-
-    nlp = spacy.load(model_name)
-    add_utf8_normalization(nlp)
-    components = ["ipv4", "ipv6", "phone", "email", "ssn", "medicare", "vin", "url"]
-    ruler = nlp.add_pipe("entity_ruler", before="ner")
-    patterns = [
-        {"label": "DATE", "pattern": [{"TEXT": {"REGEX": r"\d{1,2}/\d{1,2}/\d{4}"}}]}
-    ]
-    ruler.add_patterns(patterns)
-    nlp.add_pipe("sentencizer")
-    for c in components:
-        nlp.add_pipe(c, last=True)
-
-    return nlp
-
-
-def load_nlp_acronyms_model() -> Language:
-    """
-    Loads and returns a NLP model used specifically for acronym identification.
-
-    Args:
-        model_name: a name of the model
-
-    Returns:
-        a Spacy's text-processing pipeline object.
-    """
-
-    nlp_acronyms = spacy.load(consts.ACRONYMS_MODEL_DIR)
-    nlp_acronyms.add_pipe("sentencizer")
-
-    return nlp_acronyms
-
-
 def run_nlp(paragraphs: List[Paragraph]) -> Dict[LinePos, List[Dict]]:
     """
     Processes text paragraphs and returns a dictionary object containing information
@@ -1202,7 +592,7 @@ def run_nlp(paragraphs: List[Paragraph]) -> Dict[LinePos, List[Dict]]:
 
     nlp = load_nlp_model()
     nlp_acronyms = load_nlp_acronyms_model()
-    encoder_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+    encoder_model = load_text_encoder_model()
 
     subs = {}
     for paragraph in paragraphs:
@@ -1222,329 +612,6 @@ def run_nlp(paragraphs: List[Paragraph]) -> Dict[LinePos, List[Dict]]:
     lines_subs = _map_subs_to_lines(subs, paragraphs)
 
     return lines_subs
-
-
-def _get_pdf_lines(pdf: Document) -> Dict[str, List[LineInfo]]:
-    """
-    Finds and returns all spans in the PDF document.
-
-    Args:
-        pdf: a PyMuPDF document object.
-
-    Returns:
-        a dictionary of all spans found in the page where key refers to a specific line
-        in the text and values refer to a list of spans found in the specific line.
-    """
-
-    pdf_lines = {}
-
-    for page in pdf:
-        lines = get_pdf_page_lines(page)
-        for line, line_infos in lines.items():
-            if line in pdf_lines:
-                pdf_lines[line].extend(line_infos)
-            else:
-                pdf_lines[line] = line_infos
-
-    return pdf_lines
-
-
-def get_pdf_span_boundaries(span: Dict) -> Rect:
-    """
-    Calculates the exact bounding box boundaries of a span so that the original span
-    bounding box will shrink to the height and width of the text content.
-
-    Args:
-        span: a span object
-
-    Returns:
-        a bounding box boundaries matching exactly the content of the span
-    """
-
-    a = span["ascender"]
-    d = span["descender"]
-    r = fitz.Rect(span["bbox"])
-    o = fitz.Point(span["origin"])
-    r.y1 = o.y - span["size"] * d / (a - d)
-    r.y0 = r.y1 - span["size"]
-
-    return r
-
-
-def get_pdf_page_lines(page: Page) -> Dict[str, List[LineInfo]]:
-    """
-    Finds and returns all lines in the page.
-
-    Args:
-        page: a PyMuPDF page object.
-
-    Returns:
-         a dictionary of all lines found in the page where key refers to a specific line
-         in the text and values refer to a list of spans found in the specific line.
-    """
-
-    pdf_spans = {}
-    blocks = page.get_text("dict")["blocks"]
-    zoom_level = 3
-    zoom_matrix = fitz.Matrix(zoom_level, zoom_level)
-    page_pixmap = page.get_pixmap(matrix=zoom_matrix)
-
-    for block_idx, block in enumerate(blocks):
-        _process_text_block(
-            pdf_spans, page.number, block, block_idx, page_pixmap, zoom_level
-        )
-
-    return pdf_spans
-
-
-def _process_text_block(
-    pdf_spans: Dict[str, List[SpanInfo]],
-    page_number: int,
-    block: Dict,
-    block_idx: int,
-    page_pixmap: Pixmap,
-    zoom_level: int,
-) -> None:
-    """
-    Processes a page’s text block and updates the dict object containing all
-    PDF spans found in the page.
-
-    Args:
-        pdf_spans: a dictionary of all spans found in the page where key refers
-                   to a specific line in the text and values refer to a list of
-                   spans found in the specific line.
-        page_number: the page in the PDF document.
-        block: a page’s text block.
-        block_idx: an index of the text block relative to all text blocks in the page.
-        page_pixmap: a rendered representation of the PDF document's page, used to
-                     determine the exact color of the spans' background.
-        zoom_level: the zoom level used when creating the Pixmap object. It's used to
-                    scale line's bound box PDF coordinates to match the higher resolution
-                    space of the image representing the rendered PDF Page.
-
-    Returns:
-        None
-    """
-
-    is_text_block = block["type"] == 0
-
-    if is_text_block:
-        for line_idx, line in enumerate(block["lines"]):
-            line_text = ""
-            spans = []
-            if len(line["spans"]):
-                # Scale the bounding box coordinates from PDF space to the
-                # image space by multiplying coordinates by the zoom factor.
-                fill_color = tuple(
-                    c / 255.0
-                    for c in page_pixmap.pixel(
-                        int(line["bbox"][0] * zoom_level),
-                        int(line["bbox"][1] * zoom_level),
-                    )
-                )
-
-            for span in line["spans"]:
-                span_info = _get_span_info(span, fill_color, text_start=len(line_text))
-                line_text += span_info["text"]
-                # For spans containing only whitespace characters the 'size' key won't be set.
-                # if "size" in span_info:
-                spans.append(span_info)
-            if line_text != "":
-                line_info = _get_line_info(
-                    page_number, block_idx, line_idx, line_text, line["bbox"], spans
-                )
-                occurences = pdf_spans.get(line_text, [])
-                occurences.extend([line_info])
-                pdf_spans[line_text] = occurences
-
-
-def _get_span_info(
-    span: dict, fill_color: Tuple[float, float, float], text_start: int
-) -> SpanInfo:
-    """
-    Creates and returns a SpanInfo wrapper for the span dictionary.
-
-    Args:
-        span: a span dictionary.
-        fill_color: span background color.
-        text_start: position of the first character in the span relative to the
-                    span's position in the line that contains the span measured
-                    in number of characters.
-
-    Returns:
-        a SpanInfo object.
-    """
-
-    span_text = span["text"]
-
-    # if span_text.strip() == "":
-    #    return SpanInfo(text=span_text)
-
-    span_bbox = get_pdf_span_boundaries(span)
-    span_info = SpanInfo(
-        size=span["size"],
-        font=span["font"],
-        color=span["color"],
-        fill_color=fill_color,
-        alpha=span["alpha"],
-        origin=span["origin"],
-        bbox=span["bbox"],
-        span_bbox=span_bbox,
-        # Use original text instead of the whitespaces the stripped text
-        # will be used to match text of sentences returned by the spaCy model.
-        text=span_text,
-        text_start=text_start,
-        text_end=text_start + len(span_text),
-    )
-
-    return span_info
-
-
-def _get_line_info(
-    page_number: int,
-    block_idx: int,
-    line_idx: int,
-    line_text: str,
-    line_bbox: Tuple[float, float, float],
-    spans: List[SpanInfo],
-) -> LineInfo:
-    """
-    Creates and returns a LineInfo object.
-
-    Args:
-        page_number: index of the page containing the line.
-        block_idx: a PyMuPDF's Page text block index.
-        line_idx: an index of the line within the text block.
-        line_text: text of the line.
-        line_bbox: line's bounding box boundaries.
-        spans: a list of all spans found in the line.
-
-    Returns:
-        a LineInfo object
-    """
-
-    spans_max_y = max([s["span_bbox"][-1] for s in spans])
-    line_info = LineInfo(
-        page_number=page_number,
-        block_index=block_idx,
-        line_index=line_idx,
-        line_bbox=line_bbox,
-        spans_bbox=(
-            (
-                spans[0]["span_bbox"][0],
-                spans[0]["span_bbox"][1],
-                spans[-1]["span_bbox"][-2],
-                spans_max_y,
-            )
-        ),
-        text=line_text,
-        spans=spans,
-    )
-
-    return line_info
-
-
-def get_paragraphs(pdf: Document, line_gap_threshold: int = 5) -> List[Paragraph]:
-    """
-    Returns a list of text paragraphs.
-
-    Args:
-        pdf: a PyMuPDF Document object.
-        line_gap_threshold: a minimum gap required, between neighboring lines, in
-                            order to consider the lines as part of the same paragraph.
-
-    Returns:
-        a list of Paragraph objects.
-    """
-
-    sorted_line_infos = _get_sorted_pdf_lines(pdf)
-    paragraphs = _group_lines_into_paragraphs(sorted_line_infos, line_gap_threshold)
-
-    return paragraphs
-
-
-def _get_sorted_pdf_lines(pdf: Document) -> List[LineInfo]:
-    """
-    Extracts text lines from the PDF documents and returns them
-    sorted by the page number and the spans bounding box in ascending
-    order.
-
-    Args:
-        pdf: a PyMuPDF Document object.
-
-    Returns:
-        a list of sorted PDF document text lines.
-    """
-
-    pdf_lines = _get_pdf_lines(pdf)
-    all_lines = []
-
-    for line_infos in pdf_lines.values():
-        all_lines.extend(line_infos)
-
-    return sorted(all_lines, key=lambda l: (l.page_number, l.spans_bbox[-1]))
-
-
-def _group_lines_into_paragraphs(
-    line_infos: List[LineInfo], line_gap_threshold: int
-) -> List[Paragraph]:
-    """
-    Groups lines into paragraphs.
-
-    Args:
-        line_infos: a list of LineInfo metadata objects.
-        line_gap_threshold: a minimum gap required, between neighboring lines, in
-                            order to consider the lines as part of the same paragraph.
-
-    Returns:
-        a list of paragraphs.
-    """
-
-    paragraphs_groups = []
-    current_paragraph = []
-    last_y = None
-    char_offset = 0
-    paragraph_line_index = 0
-    current_page_num = 0
-
-    for line_info in line_infos:
-        _, y0, _, y1 = line_info.spans_bbox
-
-        if (
-            last_y is not None and (y0 - last_y) > line_gap_threshold
-        ) or line_info.page_number != current_page_num:
-            if current_paragraph:
-                paragraphs_groups.append(current_paragraph)
-            current_paragraph = []
-            char_offset = 0
-            paragraph_line_index = 0
-            current_page_num = line_info.page_number
-
-        temp_line_info = line_info._replace(
-            line_start_char=char_offset,
-            line_end_char=char_offset + len(line_info.text),
-            paragraph_line_index=paragraph_line_index,
-        )
-        current_paragraph.append(temp_line_info)
-        # Each line will be separated by a whitespace character.
-        char_offset += len(temp_line_info.text) + 1
-        last_y = y1
-        paragraph_line_index += 1
-
-    if current_paragraph:
-        paragraphs_groups.append(current_paragraph)
-
-    return [
-        _create_paragraph(idx, group) for idx, group in enumerate(paragraphs_groups)
-    ]
-
-
-def _create_paragraph(index: int, lines: List[LineInfo]) -> Paragraph:
-    text = " ".join([line_info.text for line_info in lines])
-
-    return Paragraph(
-        index=index, text=text, lines=lines, page_number=lines[0].page_number
-    )
 
 
 def _map_subs_to_lines(
@@ -1606,55 +673,6 @@ def _map_subs_to_lines(
     return lines_subs
 
 
-def extract_pdf_images(pdf: Document) -> List[ImageInfo]:
-    """
-    Returns a list of all images (directly or indirectly) referenced by the page.
-
-    Args:
-        pdf: a PyMuPDF Document object
-
-    Returns:
-        A list of ImageInfo objects wrapping information about images in the page.
-    """
-
-    images = []
-
-    for page in pdf:
-        for img in page.get_images(full=True):
-            xref = img[0]
-            base_image = page.parent.extract_image(xref)
-            image_bytes = base_image["image"]
-            images.append(
-                ImageInfo(
-                    xref=xref,
-                    page_number=page.number,
-                    ext=base_image["ext"],
-                    data=Image.open(io.BytesIO(image_bytes)),
-                )
-            )
-
-    return images
-
-
-def extract_pdf_drawings(pdf: Document) -> Dict[int, List]:
-    """
-    Returns a list of vector graphics found in the page.
-
-    Args:
-        pdf: a PyMuPDF Document object
-
-    Returns:
-        a dictionary where key represents page number and the value a list vector graphics object.
-    """
-
-    drawings = {}
-
-    for page in pdf:
-        drawings[page.number] = page.get_drawings()
-
-    return drawings
-
-
 def save_images(
     images: List[ImageInfo], dest_dir: str = tempfile.gettempdir()
 ) -> Generator[SavedImageInfo, None, None]:
@@ -1678,188 +696,6 @@ def save_images(
         yield SavedImageInfo(
             img_path=img_path, xref=img["xref"], page_number=img["page_number"]
         )
-
-
-def save_drawings(
-    drawings: List,
-    page_width: int,
-    page_height: int,
-    dest_dir: str = tempfile.gettempdir(),
-) -> Generator[SavedDrawingInfo, None, None]:
-    """
-    Saves each drawing, to an image, on a local file system and returns
-    information about each saved image containing drawing.
-
-    Args:
-        drawings: a list of vector graphics in a page.
-        page_width: initial width of the image containing drawings.
-        page_height: initial height of the image containing drawings.
-        dest_dir: a path to the folder where images, containing drawings will be saved.
-
-    Returns:
-        For each image containing a drawing, it returns information about the image,
-        such as the image path, its boundaries and the number of the pages where the
-        drawings were found.
-    """
-
-    for page_num, page_drawings in drawings.items():
-        image = Image.new("RGB", (page_width, page_height), "white")
-        draw = ImageDraw.Draw(image)
-        # all_drawings_bbox = None
-
-        for idx, drawing in enumerate(page_drawings):
-            drawing_bbox = _draw_paths(draw, drawing["items"])
-
-            if drawing_bbox:
-                cropped_image = image.crop(drawing_bbox)
-                if 0 not in cropped_image.size:
-                    img_name = f"{page_num}_{idx}.jpeg"
-                    img_path = os.path.join(dest_dir, img_name)
-                    cropped_image.save(img_path)
-
-                    yield SavedDrawingInfo(img_path, drawing_bbox, page_num)
-
-
-def _draw_paths(
-    draw: ImageDraw, paths: List
-) -> Optional[Tuple[float, float, float, float]]:
-    """
-    Draws supported path types such as line and cubic Bézier curve in an image.
-
-    Args:
-        draw: PIL ImageDraw module.
-        paths: a list of tuples containing information about the object that need to be draw.
-
-    Returns:
-        if there is at least one supported path, in the list of paths, it returns coordinates of
-        bounding box containing all drawings, otherwise it returns None.
-    """
-
-    min_x, min_y = float("inf"), float("inf")
-    max_x, max_y = 0, 0
-    bbox = [min_x, min_y, max_x, max_y]
-
-    for path in paths:
-        if path[0] == "l":  # Line segment
-            _draw_line(draw, path)
-            bbox = _update_bbox(min_x, min_y, max_x, max_y, *path[1:])
-        # elif path[0] == "re":  # Rectangle
-        #    _draw_rectangle(draw, path)
-        #    bbox = _update_bbox(min_x, min_y, max_x, max_y, path[1][:2], path[1][2:])
-        elif path[0] == "c":  # Curve (quadratic Bezier)
-            _draw_curve(draw, path)
-            bbox = _update_bezier_bbox(min_x, min_y, max_x, max_y, path[1:])
-
-        min_x, min_y, max_x, max_y = bbox
-
-    return None if float("inf") in bbox else bbox
-
-
-def _draw_line(draw: ImageDraw, path: Tuple[str, Point, Point]) -> None:
-    """
-    Draws a line.
-
-    Args:
-        draw: PIL ImageDraw module.
-        path: a tuple containing information about the line such as the starting and the ending point.
-
-    Returns:
-        None
-    """
-    (x0, y0), (x1, y1) = path[1:]
-    draw.line((x0, y0, x1, y1), fill="black", width=2)
-
-
-def _draw_rectangle(draw: ImageDraw, path: Tuple[str, Rect, int]) -> None:
-    """
-    Draws a rectangle
-
-    Args:
-        draw: PIL ImageDraw module.
-        path: a tuple containing information about the rectangle such as the rectangle coordinates.
-
-    Returns:
-        None
-    """
-
-    x0, y0, x1, y1 = path[1]
-    draw.rectangle((x0, y0, x1, y1), outline="black")
-
-
-def _draw_curve(draw: ImageDraw, path: Tuple[str, Point, Point, Point, Point]) -> None:
-    """
-    Draws a cubic Bézier curve
-
-    Args:
-        draw: PIL ImageDraw module.
-        path: a tuple containing information about the curve such as the starting, the ending
-              and the control points (p2 and p3).
-
-    Returns:
-        None
-    """
-
-    (x0, y0), (x1, y1), (x2, y2), (x3, y3) = path[1:]
-    draw.line((x0, y0, x1, y1, x2, y2, x3, y3), fill="black", width=2)
-
-
-def _update_bbox(
-    min_x: float, min_y: float, max_x: float, max_y: float, *points: Point
-) -> Tuple[float, float, float, float]:
-    """
-    Calculates and returns boundaries for a bounding box that surrounds
-    provided list of coordinates.
-
-    Args:
-        min_x: initial minimum X coordinate for the bounding box.
-        min_y: initial minimum Y coordinate for the bounding box.
-        max_x: initial maximum X coordinate for the bounding box.
-        max_y: initial maximum Y coordinate for the bounding box.
-        points: a sequence of tuple objects representing coordinates.
-
-    Returns:
-        the coordinates of the bounding box.
-    """
-
-    for x, y in points:
-        min_x = min(min_x, x)
-        max_x = max(max_x, x)
-        min_y = min(min_y, y)
-        max_y = max(max_y, y)
-
-    return min_x, min_y, max_x, max_y
-
-
-def _update_bezier_bbox(
-    min_x: float,
-    min_y: float,
-    max_x: float,
-    max_y: float,
-    points: List[Tuple[float, float]],
-) -> Tuple[float, float, float, float]:
-    """
-    Calculates and returns boundaries for a bounding box that surrounds
-    provided list of coordinates.
-
-    Args:
-        min_x: initial minimum X coordinate for the bounding box.
-        min_y: initial minimum Y coordinate for the bounding box.
-        max_x: initial maximum X coordinate for the bounding box.
-        max_y: initial maximum Y coordinate for the bounding box.
-        points: a sequence of tuple objects representing coordinates.
-
-    Returns:
-        the coordinates of the bounding box.
-    """
-
-    (x0, y0), (_, y1), (x2, y2), (x3, y3) = points
-
-    return (
-        min(min_x, x0),
-        min(min_y, y0, y1, y2, y3),
-        max(max_x, x2, x3),
-        max(max_y, y0, y1, y2, y3),
-    )
 
 
 def _get_images_redaction(
@@ -1886,7 +722,7 @@ def _get_images_redaction(
 
     for img_path, img_info in images_text.items():
         page_number, img_xref = [int(i) for i in Path(img_path).stem.split("_")]
-        img_rect = pdf[page_number].get_image_rects(img_xref)[0]
+        img_rect = get_image_rects(pdf, page_number, img_xref)[0]
 
         for line in img_info.text_lines:
             doc = nlp(line["text"])
@@ -1930,9 +766,7 @@ def get_drawings_redaction(
 
     for img_path, is_handwritten_signature in analysis_result:
         if is_handwritten_signature:
-            drawings_info = [d for d in drawings_images_info if d.img_path == img_path][
-                0
-            ]
+            drawings_info = [d for d in drawings_images_info if d.img_path == img_path][0]
             redactions.append(
                 RedactInfo(
                     page_number=drawings_info.page_number,
@@ -1942,65 +776,6 @@ def get_drawings_redaction(
             )
 
     return redactions
-
-
-def _add_redactions(
-    pdf: Document,
-    text_redactions: List[TextRedactInfo],
-    images_redactions: List[RedactInfo],
-    drawings_redactions: List[RedactInfo],
-    fill_color=(0, 0, 0),
-) -> None:
-    """
-    Adds redaction annotations areas for text, images and drawings in the PDF document.
-
-    Args:
-        pdf: PyMuPDF Document object.
-        text_redactions: a list of text redactions.
-        images_redactions: a list of images redactions.
-        drawings_redactions: a list of drawings redactions.
-        fill_color: the fill color of the redaction rectangle.
-
-    Returns:
-        None
-    """
-
-    rects_per_page = {}
-
-    _ = [
-        rects_per_page.setdefault(r["page_number"], []).append(r)
-        for redacts in [text_redactions, images_redactions, drawings_redactions]
-        for r in redacts
-    ]
-
-    # Merging rectangles should be done pagewise
-    for page_num, rects in rects_per_page.items():
-        rects_bboxes = [r["rect"] for r in rects]
-        merged_rects = (
-            merge_intersecting_rects(rects_bboxes)
-            if len(rects_bboxes) > 1
-            else rects_bboxes
-        )
-        for rect in merged_rects:
-            pdf[page_num].add_redact_annot(rect, fill=fill_color)
-
-
-def _draw_redact_rects(pdf: Document, redacts: List[TextRedactInfo]) -> None:
-    """
-    Draws redaction rectangle.
-
-    Args:
-        pdf: PyMuPDF Document object.
-        redacts: a list of texts' redactions.
-
-    Returns:
-        None
-    """
-
-    for redact in redacts:
-        pdf[redact["page_number"]].draw_rect(
-            redact["draw_rect"], fill=redact["fill_color"]
-        )
 
 
 def _process_pdf_images(pdf: Document) -> List[RedactInfo]:
@@ -2067,45 +842,6 @@ def _process_text_content(
     return paragraphs, substitute_page_entities(pdf, lines_subs)
 
 
-def _apply_redactions(
-    pdf: Document,
-    text_redactions: List[TextRedactInfo],
-    images_redactions: List[RedactInfo],
-    drawings_redactions: List[RedactInfo],
-) -> None:
-    """
-    Applies redactions of PDF objects and draws redaction rectangles.
-
-    Args:
-        text_redactions: a list of text redactions.
-        images_redactions: a list of images redactions.
-        drawings_redactions: a list of drawings redactions.
-
-    Returns:
-        None
-    """
-
-    _add_redactions(pdf, text_redactions, images_redactions, drawings_redactions)
-
-    for page in pdf:
-        page.apply_redactions()
-
-    _draw_redact_rects(pdf, text_redactions)
-
-
-def _save_processed_document(pdf: Document, output_path: str) -> None:
-    """
-    Stores the optimized version of the document, regarding its size, to the provided path.
-
-    Args:
-        pdf: PyMuPDF Document object.
-        output_path: a path where the PDF document should be saved.
-    """
-
-    pdf.subset_fonts()
-    pdf.ez_save(output_path.absolute().as_posix())
-
-
 def _get_processing_document_paths(
     input_file: str, output_dir: str
 ) -> Tuple[Path, Path]:
@@ -2155,6 +891,6 @@ def process_document(input_file: str, output_dir: str, reconstruct: bool) -> Non
         if reconstruct:
             _reconstruct_deleted_text(pdf, text_redactions, paragraphs)
 
-        _apply_redactions(pdf, text_redactions, images_redactions, drawings_redactions)
+        apply_redactions(pdf, text_redactions, images_redactions, drawings_redactions)
 
-        _save_processed_document(pdf, output_path)
+        save_processed_document(pdf, output_path)
