@@ -1,0 +1,31 @@
+source,replacement1,replacement2
+ArialMT,Helvetica,Liberation Sans
+Arial-BoldMT,Helvetica Bold,Liberation Sans Bold
+TimesNewRomanPSMT,Times New Roman,Liberation Serif
+TimesNewRomanPS-BoldMT,Times New Roman Bold,Liberation Serif Bold
+CourierNewPSMT,Courier New,Liberation Mono
+CourierNewPS-BoldMT,Courier New Bold,Liberation Mono Bold
+Helvetica,Arial,Liberation Sans
+Helvetica-Bold,Arial Bold,Liberation Sans Bold
+Verdana,Tahoma,DejaVu Sans
+Verdana-Bold,Tahoma Bold,DejaVu Sans Bold
+Georgia,Times New Roman,Liberation Serif
+Georgia-Bold,Times New Roman Bold,Liberation Serif Bold
+TrebuchetMS,Tahoma,DejaVu Sans
+TrebuchetMS-Bold,Tahoma Bold,DejaVu Sans Bold
+Calibri,Arial,Roboto
+Calibri-Bold,Arial Bold,Roboto Bold
+Cambria,Times New Roman,Liberation Serif
+Cambria-Bold,Times New Roman Bold,Liberation Serif Bold
+Garamond,Georgia,EB Garamond
+Garamond-Bold,Georgia Bold,EB Garamond Bold
+Arial-ItalicMT,Helvetica Oblique,Liberation Sans Italic
+TimesNewRomanPS-ItalicMT,Times New Roman Italic,Liberation Serif Italic
+CourierNewPS-ItalicMT,Courier New Italic,Liberation Mono Italic
+Helvetica-Oblique,Arial Italic,Liberation Sans Italic
+Verdana-Italic,Tahoma Italic,DejaVu Sans Oblique
+Georgia-Italic,Times New Roman Italic,Liberation Serif Italic
+TrebuchetMS-Italic,Tahoma Italic,DejaVu Sans Oblique
+Calibri-Italic,Arial Italic,Roboto Italic
+Cambria-Italic,Times New Roman Italic,Liberation Serif Italic
+Garamond-Italic,Georgia Italic,EB Garamond Italic
