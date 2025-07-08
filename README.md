@@ -55,16 +55,33 @@ and redact PII information in PDF documents.
 
 🚧 _This section will be defined in a future update._
 
-## 4. Prerequisities
+## 4. Process
+
+The overall process is shown in the following diagram:
+
+```mermaid
+sequenceDiagram
+    run_document_processing->>document_processor: process_document
+    document_processor->>document_processor: _process_pdf_images
+    document_processor->>document_processor: _process_pdf_drawings
+    document_processor->>document_processor: _process_text_content
+    alt should reconstruct text
+        document_processor->>document_processor: _reconstruct_deleted_text
+    end
+    document_processor->>utils/pdf: apply_redactions
+    document_processor->>utils/pdf: save_processed_document
+```
+
+## 5. Prerequisities
 
 Tesseract-OCR 5.5.0 is required to be installed on the system running the code. In order for Tesseract-OCR commands
 to be available inside terminal Tesseract-OCR installation folder needs to be added to the **PATH** environment variable.
 
-## 4. Data annotations
+## 6. Data annotations
 
 🚧 _This section will be defined in a future update._
 
-## 5. Synthetic data generation
+## 7. Synthetic data generation
 
 For the synthetic text data generation, the script **src/piipurge/utils/synth_text_generator.py** is primarily used.
 It replaces a specific placeholder for entities description with the fakes values generated using the Faker package.
@@ -80,16 +97,11 @@ The script **paraphraser.py**, by default, uses the **Vamsi/T5_Paraphrase_Paws**
 better when the entity names placeholders contain more descriptive name for the entity instead of the shorter version used 
 for some of the Spacy's entity types such as the ORG or the LOC entity types.
 
-## 6. Fine-tunning the spancat model
+## 8. Fine-tunning the spancat model
 
 🚧 _This section will be defined in a future update._
 
-## Issues
-
-The function **_find_entity_boundaries** finds matching string using test similarity because of it and because the search is performed on pre-normalized text, the search results will be suboptimal. In some cases some of the characters will be left out from the search results.
-One of the alternate solutions would be to search for the string by comparing n-grams.
-
-## Running the code
+## 9. Running the code
 
 Before running the code the required prerequisites need to be installed. 
 This can be done by running the following command:
@@ -119,3 +131,11 @@ docker run -d -p 8501:8501 -v ~/.cache/huggingface:/tmp --name test piipurge:lat
 in the container in order to avoid unnecessary download of ML models from the Huggingface Hub inside the container instance.
 This is recommended if the ML models are already downloaded on the host machine otherwise the folder mapping instruction can be
 removed from the command. 
+
+## 10. Running the unit tests
+
+To run the unit tests execute the following code from the project root:
+
+```bash
+python -m pytest tests\unit
+```
